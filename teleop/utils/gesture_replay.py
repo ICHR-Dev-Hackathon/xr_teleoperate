@@ -20,18 +20,22 @@ GesturePlayer produces the commanded joint angles tick by tick, like gesture_ser
 The gesture's own gains (arm_kp, arm_kd) and "return_neutral" are not used: the teleoperation
 arm controller keeps its gains, and the arms stay in the last pose until the operator resumes.
 
-Other robots: a file may carry "robot": "<arm type>" (the --arm value it was recorded with,
-e.g. "H2"); a file without it is a navigation-stack gesture for the G1 ("G1_29"). A gesture is
-only valid on the robot type it was recorded on (other geometry, other joint limits), so
-check_robot() refuses a mismatch, and the angles are clipped to the limits of the robot at hand.
+Gestures are robot specific. A file may carry "robot": "<arm type>" (the --arm value it was
+recorded with, e.g. "H2" or "R1_A5"); a file without it is a navigation-stack gesture for the G1
+("G1_29"). The number of values per pose is the number of arm joints of that arm type
+(ARM_JOINTS: 8, 10 or 14, left arm first, in the order of its <arm>_JointArmIndex). A gesture is
+only valid on the arm type it was recorded on (other joints, geometry and limits), so a mismatch
+is refused, and the angles are clipped to the joint limits of the robot at hand.
 """
 import json
 
 import numpy as np
 
-NUM_ARM = 14
+NUM_ARM = 14                  # arm joints in a navigation-stack (G1) gesture
 DEFAULT_ROBOT = "G1_29"       # files without "robot": the navigation stack's gestures
-GESTURE_ARMS = ("G1_29", "H2")    # --arm values whose arms are these 14 joints (motors 15..28) and were checked
+# Arm joints (values per pose) of every --arm value: len(<arm>_JointArmIndex) in robot_arm.py.
+ARM_JOINTS = {"G1_29": 14, "G1_23": 10, "H1_2": 14, "H1": 8, "H2": 14, "R1_A5": 10, "R1_A7": 14}
+GESTURE_ARMS = tuple(ARM_JOINTS)
 APPROACH_VEL = 0.4            # rad/s, navigation stack setting "approach_vel" (default)
 MAX_VEL = 2.0                 # rad/s, navigation stack setting "max_vel" (default)
 MAX_VEL_RANGE = (0.2, 4.0)    # its allowed range
@@ -53,12 +57,13 @@ class GestureFileError(ValueError):
 
 
 def _poses(values, what, limits):
+    joints = len(limits)
     try:
         arr = np.asarray(values, dtype=float)
     except (TypeError, ValueError):
         raise GestureFileError(f"{what}: not numbers") from None
-    if arr.ndim != 2 or arr.shape[1] != NUM_ARM or not np.all(np.isfinite(arr)):
-        raise GestureFileError(f"{what}: every pose needs {NUM_ARM} finite joint angles")
+    if arr.ndim != 2 or arr.shape[1] != joints or not np.all(np.isfinite(arr)):
+        raise GestureFileError(f"{what}: every pose needs {joints} finite joint angles")
     return np.clip(arr, limits[:, 0], limits[:, 1])
 
 
@@ -70,10 +75,13 @@ def check_robot(gesture, arm):
         raise GestureFileError(f"this gesture was recorded on {gesture['robot']} arms, not {arm}")
 
 
-def load_gesture(path, limits=None):
-    """Read and check a gesture file. Joint angles are clipped to `limits` ((14, 2) lower/upper,
-    the joint limits of the robot at hand); by default to the G1 limits of the navigation stack."""
-    limits = ARM_LIMITS if limits is None else np.asarray(limits, dtype=float).reshape(NUM_ARM, 2)
+def load_gesture(path, limits=None, arm=None):
+    """Read and check a gesture file.
+
+    `arm`: the --arm value of the robot at hand; a gesture recorded on another arm type is refused.
+    `limits`: (joints, 2) lower/upper joint limits of the robot at hand; the angles are clipped to
+    them. Without limits a G1 gesture is clipped to the navigation stack's G1 limits and a gesture
+    of another robot is not clipped at all (teleop_hand_and_arm.py always passes the limits)."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -83,6 +91,16 @@ def load_gesture(path, limits=None):
         raise GestureFileError("not a gesture file")
     kind = data.get("kind")
     robot = str(data.get("robot") or DEFAULT_ROBOT)
+    joints = ARM_JOINTS.get(robot)
+    if joints is None:
+        raise GestureFileError(f"unknown robot {robot!r} in the gesture file")
+    if arm is not None:
+        check_robot({"robot": robot}, arm)
+    if limits is None:
+        limits = ARM_LIMITS if robot == DEFAULT_ROBOT else np.column_stack([np.full(joints, -np.inf), np.full(joints, np.inf)])
+    limits = np.asarray(limits, dtype=float)
+    if limits.shape != (joints, 2):
+        raise GestureFileError(f"{robot} gestures have {joints} arm joints, the joint limits given have {len(limits)}")
     if kind == "continuous":
         samples = _poses(data.get("samples") or [[]], "samples", limits)
         if not 2 <= len(samples) <= MAX_SAMPLES:
@@ -120,7 +138,10 @@ class GesturePlayer:
 
     def __init__(self, gesture, q_now, speed=None, max_vel=MAX_VEL):
         self.kind = gesture["kind"]
-        self.cmd = np.array(q_now, dtype=float).reshape(NUM_ARM)
+        self.cmd = np.array(q_now, dtype=float).reshape(-1)
+        first = gesture["samples"][0] if self.kind == "continuous" else gesture["steps"][0]["arm_pose"]
+        if len(self.cmd) != len(first):
+            raise GestureFileError(f"the gesture has {len(first)} arm joints, the robot has {len(self.cmd)}")
         self.max_vel = float(min(max(max_vel or MAX_VEL, MAX_VEL_RANGE[0]), MAX_VEL_RANGE[1]))
         self.done = False
         self.phase = "approach"            # "approach" -> "play" -> "done"
@@ -194,7 +215,7 @@ class GesturePlayer:
             self.phase = "play"
 
     def step(self, dt):
-        """Advance by dt seconds; returns the commanded arm joint angles (14)."""
+        """Advance by dt seconds; returns the commanded arm joint angles (one per arm joint)."""
         if not self.done:
             if self.kind == "continuous":
                 self._step_continuous(dt)

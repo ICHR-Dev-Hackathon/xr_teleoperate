@@ -167,8 +167,15 @@ class Inspire_Controller_FTP:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
                        dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
         logger_mp.info("Initialize Inspire_Controller_FTP...")
-        from inspire_sdkpy import inspire_dds  # lazy import
-        import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+        try:
+            from inspire_sdkpy import inspire_dds  # lazy import
+            import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+        except ImportError:
+            # inspire_sdkpy needs PyQt5 / pymodbus just to be imported; the two message types and
+            # the default command are all that is used here (see inspire_ftp_msgs.py).
+            from teleop.robot_control import inspire_ftp_msgs as inspire_dds
+            inspire_hand_default = inspire_dds
+            logger_mp.info("inspire_sdkpy is not installed: using the built-in Inspire FTP message types.")
         self.inspire_hand_default = inspire_hand_default
         self.fps = fps
         self.Unit_Test = Unit_Test

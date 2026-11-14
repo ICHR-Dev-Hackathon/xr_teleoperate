@@ -21,7 +21,7 @@ from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_Arm
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
-from teleop.utils.gesture_replay import GesturePlayer, GestureFileError, load_gesture, check_robot
+from teleop.utils.gesture_replay import GesturePlayer, GestureFileError, load_gesture
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper, G1DAgvClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -307,9 +307,7 @@ def arm_gravity_torque(arm_ik, q):
 def load_gesture_for(arm, arm_ik, path):
     """A gesture file for replay on this robot: recorded on this arm type, clipped to its joint limits."""
     model = arm_ik.reduced_robot.model
-    gesture = load_gesture(path, limits=np.column_stack([model.lowerPositionLimit, model.upperPositionLimit]))
-    check_robot(gesture, arm)
-    return gesture
+    return load_gesture(path, limits=np.column_stack([model.lowerPositionLimit, model.upperPositionLimit]), arm=arm)
 
 def frame_bgr(frame):
     """Return a decoded camera image, or None while a stream has no frame."""
@@ -364,6 +362,8 @@ if __name__ == '__main__':
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--motion-base', type=str, choices=['loco', 'g1d_agv'], default='loco', help='Select motion-control backend')
+    parser.add_argument('--tele-source', type=str, default=None, help='Take the operator motion from a tele_share.py source (e.g. tcp://192.168.50.147:8013) instead of serving an own headset page: several robots can then copy one operator. --input-mode must match the source.')
+    parser.add_argument('--hands-only', action='store_true', help='Only the hands / grippers follow the operator. The arms go to the start pose as usual and are held there: no arm IK, no arm commands while tracking.')
     parser.add_argument('--motion-no-walk', action='store_true', help='With --motion and controller input: never command the locomotion controller from the controllers (no stick walking, no damping on both sticks pressed). The robot keeps balancing by itself; only the arms and hands follow.')
     parser.add_argument('--motion-max-vx', type=float, default=0.2, help='Max forward velocity from controller stick, m/s')
     parser.add_argument('--motion-max-vy', type=float, default=0.3, help='Max lateral velocity from controller stick, m/s')
@@ -395,8 +395,11 @@ if __name__ == '__main__':
         parser.error("--ee dex1_internal does not currently support --motion.")
 
     try:
-        if args.motion and args.motion_base == "g1d_agv" and args.input_mode != "controller":
-            raise ValueError("--motion-base g1d_agv requires --input-mode controller.")
+        if args.motion and args.motion_base == "g1d_agv" and args.input_mode != "controller" and not args.motion_no_walk:
+            # Driving the base needs the sticks. With --motion-no-walk the base is not driven at all
+            # (arms only, same arm path as with the base: rt/lowcmd, no mode switch), so hand
+            # tracking is fine, e.g. for hands that only work with it (Inspire, Dex3).
+            raise ValueError("--motion-base g1d_agv requires --input-mode controller (or --motion-no-walk: base not driven).")
         if args.torso_yaw_max_rate is not None and args.torso_yaw_max_rate < 0.0:
             raise ValueError("--torso-yaw-max-rate must be non-negative.")
         if args.torso_yaw_limit < 0.0:
@@ -475,22 +478,30 @@ if __name__ == '__main__':
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=camera_config['head_camera']['binocular'],
-                                     img_shape=camera_config['head_camera']['image_shape'],
-                                     # maybe should decrease fps for better performance?
-                                     # https://github.com/unitreerobotics/xr_teleoperate/issues/172
-                                     # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
-                                     display_mode=args.display_mode,
-                                     zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{webrtc_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
-                                     arm_reference_mode="head_yaw",
-                                     left_wrist_webrtc_url=left_wrist_webrtc_url,
-                                     right_wrist_webrtc_url=right_wrist_webrtc_url,
-                                     left_wrist_aspect=left_wrist_aspect,
-                                     right_wrist_aspect=right_wrist_aspect,
-                                     )
+        if args.tele_source:
+            # Several robots, one operator: the motion comes from a tele_share.py source instead of an own
+            # headset page. Same get_tele_data(); when the source goes silent the poses stop changing and
+            # the tracking watch holds the robot.
+            from teleop.tele_share import RemoteTeleSource
+            tv_wrapper = RemoteTeleSource(args.tele_source)
+            logger_mp.info(f"Operator motion comes from {args.tele_source} (shared headset); no headset page is served here.")
+        else:
+            tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
+                                         binocular=camera_config['head_camera']['binocular'],
+                                         img_shape=camera_config['head_camera']['image_shape'],
+                                         # maybe should decrease fps for better performance?
+                                         # https://github.com/unitreerobotics/xr_teleoperate/issues/172
+                                         # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
+                                         display_mode=args.display_mode,
+                                         zmq=camera_config['head_camera']['enable_zmq'],
+                                         webrtc=camera_config['head_camera']['enable_webrtc'],
+                                         webrtc_url=f"https://{webrtc_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                         arm_reference_mode="head_yaw",
+                                         left_wrist_webrtc_url=left_wrist_webrtc_url,
+                                         right_wrist_webrtc_url=right_wrist_webrtc_url,
+                                         left_wrist_aspect=left_wrist_aspect,
+                                         right_wrist_aspect=right_wrist_aspect,
+                                         )
         controller_button_mapper = ControllerButtonMapper() if args.input_mode == "controller" else None
         
         # Controllers command the robot's locomotion (sticks walk, both sticks pressed = damping)
@@ -752,6 +763,7 @@ if __name__ == '__main__':
         previous_left_gripper_input = None
         previous_right_gripper_input = None
         last_missing_camera_warning_time = 0.0
+        hands_only_arm_q = None        # --hands-only: the arm pose held while tracking (for the recording)
 
         head_img = None
         left_wrist_img = None
@@ -1072,11 +1084,19 @@ if __name__ == '__main__':
             time_ik_start = time.time()
             left_wrist_target = apply_pose_clutch(tele_data.left_wrist_pose, left_wrist_clutch)
             right_wrist_target = apply_pose_clutch(tele_data.right_wrist_pose, right_wrist_clutch)
-            sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_target, right_wrist_target, current_lr_arm_q, current_lr_arm_dq)
-            time_ik_end = time.time()
-            logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_velocity_ramp.update()
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            if args.hands_only:
+                # Hands only: the arm controller keeps holding its last target (the start pose). The
+                # arms are neither solved for nor commanded; the hand controller follows the operator.
+                if hands_only_arm_q is None:
+                    hands_only_arm_q = np.array(current_lr_arm_q, dtype=float)
+                    logger_mp.info("Hands only: the arms stay where they are; only the hands follow.")
+                sol_q, sol_tauff = hands_only_arm_q, np.zeros_like(hands_only_arm_q)   # recorded as the arm action
+            else:
+                sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_target, right_wrist_target, current_lr_arm_q, current_lr_arm_dq)
+                time_ik_end = time.time()
+                logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+                arm_velocity_ramp.update()
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
             last_left_wrist_target = left_wrist_target.copy()
             last_right_wrist_target = right_wrist_target.copy()
 
