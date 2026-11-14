@@ -1,4 +1,5 @@
 import time
+import json
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
@@ -20,6 +21,7 @@ from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_Arm
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
+from teleop.utils.gesture_replay import GesturePlayer, GestureFileError, load_gesture, check_robot
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper, G1DAgvClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -46,6 +48,11 @@ HOLD           = False  # Holding after a stop or lost tracking, until the opera
 PROBLEM        = None   # Problem code for the operator UI, e.g. "XR-101" (tracking lost)
 XR_CONNECTED   = False  # The headset has sent tracking data at least once
 TRACKING_AGE_MS = None  # Time since the tracked hand/controller poses last changed
+REPLAY_REQUEST = None   # Operator UI: play this gesture file on the arms ({"path", "speed", "max_vel"})
+REPLAY_CANCEL  = False  # Operator UI: end the running replay, keep holding
+REPLAY         = None   # Progress of the running gesture replay for the operator UI, else None
+REPLAY_HZ      = 100.0  # Replay tick rate (no IK needed, so faster than --frequency)
+HOLD_RELEASE   = False  # Operator UI: continue after a stop that came before tracking started
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -68,6 +75,19 @@ CONTROLLER_BUTTON_ACTIONS = {
 
 def handle_control_key(key, source="keyboard"):
     global STOP, START, PAUSED, PAUSE_TOGGLE, RECORD_TOGGLE, RECORD_DISCARD, HOLD_REQUEST
+    global REPLAY_REQUEST, REPLAY_CANCEL, HOLD_RELEASE
+    if key.startswith('replay:'):
+        try:
+            request = json.loads(key[len('replay:'):])
+            REPLAY_REQUEST = {"path": str(request["path"]), "speed": request.get("speed"),
+                              "max_vel": request.get("max_vel")}
+            logger_mp.info(f"[{source}] gesture replay requested: {REPLAY_REQUEST['path']}")
+        except (ValueError, KeyError, TypeError):
+            logger_mp.warning(f"[{source}] gesture replay ignored: no gesture file given.")
+        return
+    if key == 'replay_stop':
+        REPLAY_CANCEL = True
+        return
     if key == 'hold':
         HOLD_REQUEST = True
         logger_mp.info(f"[{source}] stop requested: holding the robot where it is.")
@@ -76,6 +96,8 @@ def handle_control_key(key, source="keyboard"):
         if START and PAUSED:
             PAUSE_TOGGLE = True
             logger_mp.info(f"[{source}] resume requested.")
+        elif not START:
+            HOLD_RELEASE = True      # a stop before tracking: nothing resumes, the stop is acknowledged
         else:
             logger_mp.info(f"[{source}] resume ignored: teleop is not paused.")
         return
@@ -143,6 +165,7 @@ def get_state() -> dict:
         "PROBLEM": PROBLEM,
         "XR_CONNECTED": XR_CONNECTED,
         "TRACKING_AGE_MS": TRACKING_AGE_MS,
+        "REPLAY": REPLAY,
     }
 
 def clip_unit(value):
@@ -275,6 +298,19 @@ class TrackingWatch:
             ages.append(now - self._changed[i])
         return max(ages)
 
+def arm_gravity_torque(arm_ik, q):
+    """Feed-forward torque that holds the arms at q against gravity (as solve_ik() returns it)."""
+    import pinocchio as pin
+    model = arm_ik.reduced_robot.model
+    return pin.rnea(model, arm_ik.reduced_robot.data, np.asarray(q, dtype=float), np.zeros(model.nv), np.zeros(model.nv))
+
+def load_gesture_for(arm, arm_ik, path):
+    """A gesture file for replay on this robot: recorded on this arm type, clipped to its joint limits."""
+    model = arm_ik.reduced_robot.model
+    gesture = load_gesture(path, limits=np.column_stack([model.lowerPositionLimit, model.upperPositionLimit]))
+    check_robot(gesture, arm)
+    return gesture
+
 def frame_bgr(frame):
     """Return a decoded camera image, or None while a stream has no frame."""
     return None if frame is None else getattr(frame, "bgr", None)
@@ -328,6 +364,7 @@ if __name__ == '__main__':
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--motion-base', type=str, choices=['loco', 'g1d_agv'], default='loco', help='Select motion-control backend')
+    parser.add_argument('--motion-no-walk', action='store_true', help='With --motion and controller input: never command the locomotion controller from the controllers (no stick walking, no damping on both sticks pressed). The robot keeps balancing by itself; only the arms and hands follow.')
     parser.add_argument('--motion-max-vx', type=float, default=0.2, help='Max forward velocity from controller stick, m/s')
     parser.add_argument('--motion-max-vy', type=float, default=0.3, help='Max lateral velocity from controller stick, m/s')
     parser.add_argument('--motion-max-vyaw', type=float, default=0.3, help='Max yaw velocity from controller stick, rad/s')
@@ -456,9 +493,17 @@ if __name__ == '__main__':
                                      )
         controller_button_mapper = ControllerButtonMapper() if args.input_mode == "controller" else None
         
+        # Controllers command the robot's locomotion (sticks walk, both sticks pressed = damping)
+        # only in motion mode and unless --motion-no-walk asks for arms only.
+        stick_walking = args.motion and args.input_mode == "controller" and not args.motion_no_walk
+        body_action_scale = 0.0 if args.motion_no_walk else 0.3     # recorded stick "body action"; nothing is commanded without walking
+        if args.motion and args.input_mode == "controller" and args.motion_no_walk:
+            logger_mp.info("Motion mode without stick walking: the controllers move the arms only; "
+                           "the robot's own controller keeps the balance.")
+
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
-            if args.input_mode == "controller":
+            if stick_walking:
                 if args.motion_base == "g1d_agv":
                     loco_wrapper = G1DAgvClientWrapper()
                     logger_mp.info("Motion backend: G1-D AGV; arm commands stay on rt/lowcmd.")
@@ -625,8 +670,10 @@ if __name__ == '__main__':
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         tracking_watch = TrackingWatch()
+        gesture_player = None          # a gesture being replayed on the arms
+        replay_last_time = 0.0
         while not START and not STOP: # wait for start or stop signal.
-            time.sleep(0.033)
+            time.sleep(1.0 / REPLAY_HZ if gesture_player is not None else 0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
@@ -637,14 +684,51 @@ if __name__ == '__main__':
             TRACKING_AGE_MS = None if tracking_age is None else int(tracking_age * 1000)
             if controller_button_mapper is not None:
                 controller_button_mapper.update(tele_data)
+            if HOLD_RELEASE:
+                HOLD_RELEASE = False
+                if HOLD:
+                    HOLD = False
+                    logger_mp.info("Stop acknowledged; the arms keep their position.")
+            if REPLAY_CANCEL:
+                REPLAY_CANCEL = False
+                if gesture_player is not None:
+                    gesture_player, REPLAY = None, None
+                    logger_mp.info("Gesture replay ended by the operator; holding the arms.")
+            if REPLAY_REQUEST is not None:
+                # A gesture can be replayed before tracking starts: no headset is needed for it.
+                request, REPLAY_REQUEST = REPLAY_REQUEST, None
+                if HOLD:
+                    logger_mp.warning("Gesture replay ignored: the robot is stopped. Continue first.")
+                else:
+                    try:
+                        gesture_player = GesturePlayer(load_gesture_for(args.arm, arm_ik, request["path"]), arm_ctrl.get_current_dual_arm_q(),
+                                                       speed=request.get("speed"), max_vel=request.get("max_vel"))
+                        replay_last_time = time.time()
+                        REPLAY = gesture_player.info()
+                        logger_mp.info(f"▶️  Gesture replay started: {request['path']} "
+                                       f"(max {gesture_player.max_vel:g} rad/s), before tracking.")
+                    except (GestureFileError, TypeError, ValueError) as e:
+                        logger_mp.warning(f"Gesture replay ignored: {e}")
             if HOLD_REQUEST:
                 # Stop before tracking started: keep the arms where they are now (this also
                 # halts the move to the initial pose that starts when the controller connects).
                 HOLD_REQUEST = False
                 HOLD = True
+                if gesture_player is not None:
+                    gesture_player, REPLAY = None, None
+                    logger_mp.info("Gesture replay ended by the stop.")
                 current_q = arm_ctrl.get_current_dual_arm_q()
                 arm_ctrl.ctrl_dual_arm(current_q, np.zeros_like(current_q))
                 logger_mp.info("Stop before tracking: holding the arms at their current position.")
+            if gesture_player is not None:
+                now = time.time()
+                replay_q = gesture_player.step(min(0.05, max(0.0, now - replay_last_time)))
+                replay_last_time = now
+                arm_ctrl.ctrl_dual_arm(replay_q, arm_gravity_torque(arm_ik, replay_q))
+                REPLAY = gesture_player.info()
+                if gesture_player.done:
+                    gesture_player, REPLAY = None, None
+                    logger_mp.info("⏹️  Gesture replay finished; holding the last pose.")
 
         if STOP:
             logger_mp.info("Stop requested before tracking started.")
@@ -653,6 +737,7 @@ if __name__ == '__main__':
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         HOLD = False
         PROBLEM = None
+        gesture_player, REPLAY, REPLAY_REQUEST = None, None, None     # tracking takes the arms over
         arm_velocity_ramp.restart()
         last_motion_time = time.time()
 
@@ -707,6 +792,9 @@ if __name__ == '__main__':
                 # this also works while recording; the unfinished episode is discarded.
                 stop_requested = HOLD_REQUEST
                 HOLD_REQUEST = False
+                if gesture_player is not None:      # a replay ends here; the arms keep the last command
+                    gesture_player, REPLAY, REPLAY_REQUEST = None, None, None
+                    logger_mp.info("Gesture replay ended by the stop.")
                 if args.record and RECORD_RUNNING:
                     RECORD_RUNNING = False
                     recorder.discard_episode()
@@ -714,7 +802,7 @@ if __name__ == '__main__':
                 if not PAUSED:
                     PAUSED = True
                     RECORD_TOGGLE = False
-                    if args.motion and args.input_mode == "controller":
+                    if stick_walking:
                         loco_wrapper.Stop()
                     with xr_motion_data_ready.get_lock():
                         xr_motion_data_ready.value = False
@@ -725,12 +813,51 @@ if __name__ == '__main__':
                     PROBLEM = "XR-101"
                     logger_mp.warning(f"⏹️  Tracking lost ({tracking_age:.2f} s without new poses): holding the robot. XR-101")
 
+            if REPLAY_CANCEL:
+                REPLAY_CANCEL = False
+                if gesture_player is not None:
+                    gesture_player, REPLAY = None, None
+                    logger_mp.info("Gesture replay ended by the operator; holding the arms.")
+
+            if REPLAY_REQUEST is not None:
+                # Play a gesture file on the arms. Teleoperation is paused for it (the robot no longer
+                # follows the operator) and stays paused afterwards, until the operator resumes.
+                request, REPLAY_REQUEST = REPLAY_REQUEST, None
+                if HOLD:
+                    logger_mp.warning("Gesture replay ignored: the robot is stopped. Resume first.")
+                elif args.record and RECORD_RUNNING:
+                    logger_mp.warning("Gesture replay ignored while recording. Save or discard the episode first.")
+                else:
+                    try:
+                        gesture = load_gesture_for(args.arm, arm_ik, request["path"])
+                        if not PAUSED:
+                            PAUSED = True
+                            RECORD_TOGGLE = False
+                            if stick_walking:
+                                loco_wrapper.Stop()
+                            with xr_motion_data_ready.get_lock():
+                                xr_motion_data_ready.value = False
+                        gesture_player = GesturePlayer(gesture, arm_ctrl.get_current_dual_arm_q(),
+                                                       speed=request.get("speed"), max_vel=request.get("max_vel"))
+                        replay_last_time = time.time()
+                        REPLAY = gesture_player.info()
+                        PAUSE_TOGGLE = False
+                        logger_mp.info(f"▶️  Gesture replay started: {request['path']} "
+                                       f"(max {gesture_player.max_vel:g} rad/s). Teleoperation is paused.")
+                    except (GestureFileError, TypeError, ValueError) as e:
+                        logger_mp.warning(f"Gesture replay ignored: {e}")
+
+            if PAUSE_TOGGLE and gesture_player is not None:
+                # left X / resume during a replay only ends the replay; a second press resumes.
+                PAUSE_TOGGLE = False
+                gesture_player, REPLAY = None, None
+                logger_mp.info("Gesture replay ended; teleoperation stays paused.")
+
             if PAUSE_TOGGLE:
                 PAUSE_TOGGLE = False
                 if PAUSED:
                     controls_neutral = (
-                        not args.motion
-                        or args.input_mode != "controller"
+                        not stick_walking
                         or controller_motion_is_neutral(
                             tele_data,
                             args.torso_yaw_deadband,
@@ -781,7 +908,7 @@ if __name__ == '__main__':
                 else:
                     PAUSED = True
                     RECORD_TOGGLE = False
-                    if args.motion and args.input_mode == "controller":
+                    if stick_walking:
                         loco_wrapper.Stop()
                     with xr_motion_data_ready.get_lock():
                         xr_motion_data_ready.value = False
@@ -794,8 +921,18 @@ if __name__ == '__main__':
                     xr_motion_data_ready.value = False
                 if args.record:
                     READY = recorder.is_ready()
+                if gesture_player is not None:
+                    now = time.time()
+                    replay_q = gesture_player.step(min(0.05, max(0.0, now - replay_last_time)))
+                    replay_last_time = now
+                    arm_ctrl.ctrl_dual_arm(replay_q, arm_gravity_torque(arm_ik, replay_q))
+                    REPLAY = gesture_player.info()
+                    if gesture_player.done:
+                        gesture_player, REPLAY = None, None
+                        logger_mp.info("⏹️  Gesture replay finished; holding the last pose. Resume to follow the operator again.")
                 time_elapsed = time.time() - start_time
-                sleep_time = max(0, (1 / args.frequency) - time_elapsed)
+                loop_hz = REPLAY_HZ if gesture_player is not None else args.frequency
+                sleep_time = max(0, (1 / loop_hz) - time_elapsed)
                 time.sleep(sleep_time)
                 continue
 
@@ -891,7 +1028,7 @@ if __name__ == '__main__':
                 xr_motion_data_ready.value = tele_data.motion_data_ready
             
             # high level control
-            if args.input_mode == "controller" and args.motion:
+            if stick_walking:
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
@@ -970,9 +1107,9 @@ if __name__ == '__main__':
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * body_action_scale,
+                                               -tele_data.left_ctrl_thumbstickValue[0]  * body_action_scale,
+                                               -tele_data.right_ctrl_thumbstickValue[0] * body_action_scale]
                 elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
@@ -988,9 +1125,9 @@ if __name__ == '__main__':
                         left_hand_action = dual_hand_action_array[:6]
                         right_hand_action = dual_hand_action_array[-6:]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * body_action_scale,
+                                               -tele_data.left_ctrl_thumbstickValue[0]  * body_action_scale,
+                                               -tele_data.right_ctrl_thumbstickValue[0] * body_action_scale]
                 else:
                     left_ee_state = []
                     right_ee_state = []

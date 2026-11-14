@@ -1,4 +1,5 @@
 import os
+import json
 import zmq
 import time
 import threading
@@ -76,6 +77,8 @@ class IPC_Server:
         "CMD_HOLD": "hold",        # stop: hold the robot where it is (works while recording)
         "CMD_PAUSE": "pause_on",   # pause if running (idempotent)
         "CMD_RESUME": "resume",    # resume if paused (idempotent)
+        "CMD_REPLAY": "replay",    # play a gesture file on the arms; "arg": {"path", "speed"?, "max_vel"?}
+        "CMD_REPLAY_STOP": "replay_stop",  # end the replay, keep holding
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):
@@ -164,7 +167,10 @@ class IPC_Server:
                 return {"repid": reqid, "status": "error", "msg": f"cmd not supported: {cmd}"}
                     
             # supported cmd path
-            self.on_press(self.cmd_map[cmd])
+            key = self.cmd_map[cmd]
+            if cmd == "CMD_REPLAY":                 # the only command with an argument
+                key = "replay:" + json.dumps(msg.get("arg") or {})
+            self.on_press(key)
             return {"repid": reqid, "status": "ok", "msg": "ok"}
 
         except Exception as e:

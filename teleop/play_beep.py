@@ -1,7 +1,11 @@
 import time
 import numpy as np
-import sounddevice as sd
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except (ImportError, OSError) as exc:      # no PortAudio library (e.g. a container): beeps are off
+    sd = None
+    print(f"[play_beep] sound is not available, beeps are off: {exc}")
+_AUDIO_OK = sd is not None                 # switched off after the first failed playback
 
 # Wake up the sound card with 0.1 seconds of silence
 #sd.play(np.zeros(4410*10), 44100)
@@ -29,16 +33,24 @@ def play_beep(
     pause=0.0,
     sample_rate=44100
 ):
-    """Plays a sound with specified wave properties."""
+    """Plays a sound with specified wave properties. Without a usable sound output it does
+    nothing: a beep must never stop teleoperation (it is called from the control loop)."""
+    global _AUDIO_OK
+    if not _AUDIO_OK:
+        return
     volume = max(0.0, min(1.0, volume))
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     wave = volume * generate_wave(shape, frequency, t)
 
-    for i in range(repeats):
-        sd.play(wave, sample_rate)
-        sd.wait()
-        if i < repeats - 1 and pause > 0:
-            time.sleep(pause)
+    try:
+        for i in range(repeats):
+            sd.play(wave, sample_rate)
+            sd.wait()
+            if i < repeats - 1 and pause > 0:
+                time.sleep(pause)
+    except Exception as exc:               # e.g. sounddevice.PortAudioError: no output device
+        _AUDIO_OK = False
+        print(f"[play_beep] no usable sound output, beeps are off: {exc}")
 
 def play_arpegio(
     duration=0.1, 
