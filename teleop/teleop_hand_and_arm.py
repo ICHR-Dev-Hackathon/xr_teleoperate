@@ -41,6 +41,11 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 RECORD_DISCARD = False  # Discard current recording and return to READY state pribavoj
+HOLD_REQUEST   = False  # Stop from the operator UI: hold the robot where it is (also while recording)
+HOLD           = False  # Holding after a stop or lost tracking, until the operator resumes
+PROBLEM        = None   # Problem code for the operator UI, e.g. "XR-101" (tracking lost)
+XR_CONNECTED   = False  # The headset has sent tracking data at least once
+TRACKING_AGE_MS = None  # Time since the tracked hand/controller poses last changed
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -62,7 +67,23 @@ CONTROLLER_BUTTON_ACTIONS = {
 }
 
 def handle_control_key(key, source="keyboard"):
-    global STOP, START, PAUSED, PAUSE_TOGGLE, RECORD_TOGGLE, RECORD_DISCARD
+    global STOP, START, PAUSED, PAUSE_TOGGLE, RECORD_TOGGLE, RECORD_DISCARD, HOLD_REQUEST
+    if key == 'hold':
+        HOLD_REQUEST = True
+        logger_mp.info(f"[{source}] stop requested: holding the robot where it is.")
+        return
+    if key == 'resume':
+        if START and PAUSED:
+            PAUSE_TOGGLE = True
+            logger_mp.info(f"[{source}] resume requested.")
+        else:
+            logger_mp.info(f"[{source}] resume ignored: teleop is not paused.")
+        return
+    if key == 'pause_on':
+        if START and not PAUSED:
+            PAUSE_TOGGLE = True
+            logger_mp.info(f"[{source}] pause requested.")
+        return
     if key in ('r', 'start'):
         if not START:
             START = True
@@ -118,6 +139,10 @@ def get_state() -> dict:
         "PAUSED": PAUSED,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
+        "HOLD": HOLD,
+        "PROBLEM": PROBLEM,
+        "XR_CONNECTED": XR_CONNECTED,
+        "TRACKING_AGE_MS": TRACKING_AGE_MS,
     }
 
 def clip_unit(value):
@@ -222,6 +247,33 @@ class ArmVelocityRamp:
             ARM_VELOCITY_START + (ARM_VELOCITY_MAX - ARM_VELOCITY_START) * fraction)
         if fraction >= 1.0:
             self.start_time = None
+
+TRACKING_STALE_S = 0.5      # tracked poses frozen this long -> stop (XR-101)
+
+class TrackingWatch:
+    """Notice when the headset stops sending fresh hand/controller poses.
+
+    televuer only reports whether tracking data arrived at least once (motion_data_ready).
+    While the headset tracks, each wrist (hand or controller) pose changes with every update,
+    because real tracking always jitters a little. A pose that stays bit-identical means no
+    updates arrive for that side: the headset disconnected, or the hand/controller is lost.
+    Stopping then also prevents a frozen stick value from keeping the robot walking.
+    """
+    def __init__(self):
+        self._last = [None, None]
+        self._changed = [None, None]
+
+    def age(self, tele_data, now):
+        """Seconds since the stalest side last changed, or None before any tracking data."""
+        if not tele_data.motion_data_ready:
+            return None
+        ages = []
+        for i, pose in enumerate((tele_data.left_wrist_pose, tele_data.right_wrist_pose)):
+            sig = np.asarray(pose, dtype=np.float64).tobytes()
+            if sig != self._last[i]:
+                self._last[i], self._changed[i] = sig, now
+            ages.append(now - self._changed[i])
+        return max(ages)
 
 def frame_bgr(frame):
     """Return a decoded camera image, or None while a stream has no frame."""
@@ -572,21 +624,35 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] or Pico right A to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        tracking_watch = TrackingWatch()
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            tele_data = tv_wrapper.get_tele_data()
+            tracking_age = tracking_watch.age(tele_data, time.time())
+            XR_CONNECTED = bool(tele_data.motion_data_ready)
+            TRACKING_AGE_MS = None if tracking_age is None else int(tracking_age * 1000)
             if controller_button_mapper is not None:
-                tele_data = tv_wrapper.get_tele_data()
                 controller_button_mapper.update(tele_data)
+            if HOLD_REQUEST:
+                # Stop before tracking started: keep the arms where they are now (this also
+                # halts the move to the initial pose that starts when the controller connects).
+                HOLD_REQUEST = False
+                HOLD = True
+                current_q = arm_ctrl.get_current_dual_arm_q()
+                arm_ctrl.ctrl_dual_arm(current_q, np.zeros_like(current_q))
+                logger_mp.info("Stop before tracking: holding the arms at their current position.")
 
         if STOP:
             logger_mp.info("Stop requested before tracking started.")
             raise KeyboardInterrupt
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+        HOLD = False
+        PROBLEM = None
         arm_velocity_ramp.restart()
         last_motion_time = time.time()
 
@@ -631,6 +697,33 @@ if __name__ == '__main__':
             if STOP:
                 break
             torso_yaw_input_value = 0.0
+            tracking_age = tracking_watch.age(tele_data, start_time)
+            XR_CONNECTED = bool(tele_data.motion_data_ready)
+            TRACKING_AGE_MS = None if tracking_age is None else int(tracking_age * 1000)
+            tracking_lost = (not PAUSED and tracking_age is not None and tracking_age > TRACKING_STALE_S)
+
+            if HOLD_REQUEST or tracking_lost:
+                # Stop (operator UI) or lost tracking: hold the robot where it is. Unlike a pause
+                # this also works while recording; the unfinished episode is discarded.
+                stop_requested = HOLD_REQUEST
+                HOLD_REQUEST = False
+                if args.record and RECORD_RUNNING:
+                    RECORD_RUNNING = False
+                    recorder.discard_episode()
+                    logger_mp.warning("Recording discarded because the robot was stopped.")
+                if not PAUSED:
+                    PAUSED = True
+                    RECORD_TOGGLE = False
+                    if args.motion and args.input_mode == "controller":
+                        loco_wrapper.Stop()
+                    with xr_motion_data_ready.get_lock():
+                        xr_motion_data_ready.value = False
+                HOLD = True
+                if stop_requested:
+                    logger_mp.info("⏹️  Stop: holding the robot. Resume from the operator UI or with left X.")
+                else:
+                    PROBLEM = "XR-101"
+                    logger_mp.warning(f"⏹️  Tracking lost ({tracking_age:.2f} s without new poses): holding the robot. XR-101")
 
             if PAUSE_TOGGLE:
                 PAUSE_TOGGLE = False
@@ -647,7 +740,7 @@ if __name__ == '__main__':
                             ),
                         )
                     )
-                    if not tele_data.motion_data_ready:
+                    if not tele_data.motion_data_ready or tracking_age is None or tracking_age > TRACKING_STALE_S:
                         logger_mp.warning("Cannot resume: XR controller/hand tracking is not ready.")
                     elif not controls_neutral:
                         logger_mp.warning("Cannot resume: center both sticks and release the side triggers first.")
@@ -679,6 +772,8 @@ if __name__ == '__main__':
                             arm_velocity_ramp.restart()
                             resume_message = "matching the current controller poses"
                         PAUSED = False
+                        HOLD = False
+                        PROBLEM = None
                         last_motion_time = start_time
                         logger_mp.info(f"🟢 Teleoperation RESUMED; {resume_message}.")
                 elif args.record and RECORD_RUNNING:

@@ -72,6 +72,10 @@ class IPC_Server:
         "CMD_PAUSE_TOGGLE": "p",   # pause/resume after launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_RECORD_DISCARD": "d", # discard the episode being recorded
+        "CMD_HOLD": "hold",        # stop: hold the robot where it is (works while recording)
+        "CMD_PAUSE": "pause_on",   # pause if running (idempotent)
+        "CMD_RESUME": "resume",    # resume if paused (idempotent)
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):
